@@ -57,6 +57,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # TODO: quantize the kqv matrices
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -73,6 +74,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        # TODO: dequantize y
         return y
 
 class MLP(nn.Module):
@@ -85,10 +87,12 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
+        # x = quantize(x)
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
+        # x = dequantize(x)
         return x
 
 class Block(nn.Module):
@@ -101,8 +105,10 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
+        # x = quantize(x)
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
+        # x = dequantize(x)
         return x
 
 @dataclass
@@ -179,6 +185,7 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
+        # TODO: figure out if we need to quantize/dequantize here
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -202,6 +209,22 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+    
+    # TODO: move these functions to a more appropriate location (where they can be accessed by all modules)
+    
+    def quantize(X):
+        """
+        Given a weight matrix/input vector, quantize the weights
+        Returns quantized weights (in torch.int8)
+        """
+        pass
+
+    def dequantize(X):
+        """
+        Dequantize a given output vector X 
+        """
+        # TODO: figure out if this needs info from quantize()
+        pass
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -234,6 +257,7 @@ class GPT(nn.Module):
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
+
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
@@ -257,8 +281,14 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
+        
+        # TODO: likely quantize the weights here by iterating through the model params
+        # example: model_quantized = deepcopy(model)
+        # for param in model_quantized.parameters():
+        #   param.data = quantize(param.data)
 
         return model
+        # TODO: return model_quantized
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
