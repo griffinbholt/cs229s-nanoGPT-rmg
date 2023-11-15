@@ -7,6 +7,8 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+from quantization import quantize, dequantize
+
 from copy import deepcopy
 import math
 import inspect
@@ -210,38 +212,6 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-    
-    # TODO: move these functions to a more appropriate location (where they can be accessed by all modules)
-    
-    def quantize(X):
-        """
-        Given a weight matrix/input vector, quantize the weights
-        Returns quantized weights (in torch.int8), scale, offset
-        """
-        # Implementing the Q fn from the quadapter paper in comments
-        # Q(x) = x * (clip(round(x/s + o), 0, 255) - o) 
-        # where s = (max(x) - min(x)) / 255, o = round(-min(x)/s)
-
-        # simple zero-point is here
-        x_range = torch.max(X) - torch.min(X)
-        x_range = 1 if x_range == 0 else x_range
-
-        scale = x_range / 255
-        offset = (-torch.min(X) / scale - 128).round()
-        X_quant = torch.clip((X / scale + offset).round(), -128, 127)
-
-        # offset = - torch.min(X) / scale
-
-        # X_quant = scale * (torch.clip((X / scale + offset).round(), 0, 255) - offset)
-        return X_quant, scale, offset
-
-    def dequantize(X_quant, scale, offset):
-        """
-        Dequantize a given output vector X_quant given a scale and offset
-        """
-        return (X_quant - offset) * scale 
-        # tbqh I feel like all the operations for quadapter Q cancel each other out, so not sure how to proceed?
-        # return (X_quant / scale)
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -302,7 +272,7 @@ class GPT(nn.Module):
         model_quantized = deepcopy(model)
         for param in model_quantized.parameters():
             # we won't be dequantizing these, so we don't need scale/offset
-            param.data, _, _ = GPT.quantize(param.data)
+            param.data, _, _ = quantize(param.data)
 
         # return model
         return model_quantized
