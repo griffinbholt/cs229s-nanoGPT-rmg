@@ -18,6 +18,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import bitsandbytes as bnb
+from bitsandbytes.nn import Linear8bitLt
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -35,9 +38,11 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        #self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = bnb.nn.Linear8bitLt(config.n_embd, 3 * config.n_embd, bias=config.bias, has_fp16_weights=False, threshold=6.0)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        #self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = bnb.nn.Linear8bitLt(config.n_embd, config.n_embd, bias=config.bias, has_fp16_weights=False, threshold=6.0)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -56,11 +61,10 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v  = self.c_attn(x.to(torch.float16)).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # TODO: quantize the kqv matrices
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -76,7 +80,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(self.c_proj(y.to(torch.float16)))
         # TODO: dequantize y
         return y
 
@@ -84,16 +88,18 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        #self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = bnb.nn.Linear8bitLt(config.n_embd, 4 * config.n_embd, bias=config.bias, has_fp16_weights=False, threshold=6.0)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        #self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = bnb.nn.Linear8bitLt(4 * config.n_embd, config.n_embd, bias=config.bias, has_fp16_weights=False, threshold=6.0)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         # x = quantize(x)
-        x = self.c_fc(x)
+        x = self.c_fc(x.to(torch.float16))
         x = self.gelu(x)
-        x = self.c_proj(x)
+        x = self.c_proj(x.to(torch.float16))
         x = self.dropout(x)
         # x = dequantize(x)
         return x
@@ -270,9 +276,10 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         model_quantized = deepcopy(model)
-        for param in model_quantized.parameters():
-            # we won't be dequantizing these, so we don't need scale/offset
-            param.data, _, _ = quantize(param.data)
+        # for param in model_quantized.parameters():
+        #     # we won't be dequantizing these, so we don't need scale/offset
+        #     param_quantized, _, _ = quantize(param.data)
+        #     param.data = param_quantized.to(torch.int8)
 
         # return model
         return model_quantized
