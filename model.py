@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+from copy import deepcopy
 import math
 import inspect
 from dataclasses import dataclass
@@ -215,16 +216,32 @@ class GPT(nn.Module):
     def quantize(X):
         """
         Given a weight matrix/input vector, quantize the weights
-        Returns quantized weights (in torch.int8)
+        Returns quantized weights (in torch.int8), scale, offset
         """
-        pass
+        # Implementing the Q fn from the quadapter paper in comments
+        # Q(x) = x * (clip(round(x/s + o), 0, 255) - o) 
+        # where s = (max(x) - min(x)) / 255, o = round(-min(x)/s)
 
-    def dequantize(X):
+        # simple zero-point is here
+        x_range = torch.max(X) - torch.min(X)
+        x_range = 1 if x_range == 0 else x_range
+
+        scale = x_range / 255
+        offset = (-torch.min(X) / scale - 128).round()
+        X_quant = torch.clip((X / scale + offset).round(), -128, 127)
+
+        # offset = - torch.min(X) / scale
+
+        # X_quant = scale * (torch.clip((X / scale + offset).round(), 0, 255) - offset)
+        return X_quant, scale, offset
+
+    def dequantize(X_quant, scale, offset):
         """
-        Dequantize a given output vector X 
+        Dequantize a given output vector X_quant given a scale and offset
         """
-        # TODO: figure out if this needs info from quantize()
-        pass
+        return (X_quant - offset) * scale 
+        # tbqh I feel like all the operations for quadapter Q cancel each other out, so not sure how to proceed?
+        # return (X_quant / scale)
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -282,13 +299,13 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         
-        # TODO: likely quantize the weights here by iterating through the model params
-        # example: model_quantized = deepcopy(model)
-        # for param in model_quantized.parameters():
-        #   param.data = quantize(param.data)
+        model_quantized = deepcopy(model)
+        for param in model_quantized.parameters():
+            # we won't be dequantizing these, so we don't need scale/offset
+            param.data, _, _ = GPT.quantize(param.data)
 
-        return model
-        # TODO: return model_quantized
+        # return model
+        return model_quantized
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
