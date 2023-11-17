@@ -27,6 +27,7 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
+        # so we can use regular layer_norm
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
@@ -37,6 +38,7 @@ class CausalSelfAttention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
+        # for name, param in self.c_attn.named_parameters():
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -54,13 +56,11 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # TODO: quantize the kqv matrices
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -77,7 +77,6 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        # TODO: dequantize y
         return y
 
 class MLP(nn.Module):
@@ -90,12 +89,10 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        # x = quantize(x)
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
-        # x = dequantize(x)
         return x
 
 class Block(nn.Module):
@@ -108,10 +105,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        # x = quantize(x)
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        # x = dequantize(x)
         return x
 
 @dataclass
@@ -178,17 +173,19 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
+        # print("IDX DTYPE: ", idx.dtype)
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # print("TOK_EMB DTYPE:", tok_emb.dtype)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # print("POS_EMB DTYPE:", pos_emb.dtype)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
-        # TODO: figure out if we need to quantize/dequantize here
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -270,10 +267,15 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         model_quantized = deepcopy(model)
-        for param in model_quantized.parameters():
-            # we won't be dequantizing these, so we don't need scale/offset
-            param.data, _, _ = quantize(param.data)
-
+        quant_sd = model_quantized.state_dict()
+        quant_sd_keys = quant_sd.keys()
+        # print(sd_hf.keys())
+        for k in quant_sd_keys:
+            param = quant_sd[k]
+            param.requires_grad = False
+            param_quantized, scale, offset = quantize(param.data)
+            # just to test that quantization is working
+            param.data = dequantize(param_quantized, scale, offset)
         # return model
         return model_quantized
 

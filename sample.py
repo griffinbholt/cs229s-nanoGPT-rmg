@@ -47,6 +47,8 @@ if init_from == 'resume':
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+elif init_from.startswith("gpt2-quantized"):
+    pass # we'll load from file here
 
 model.eval()
 model.to(device)
