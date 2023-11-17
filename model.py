@@ -6,7 +6,6 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
-
 from quantization import quantize, dequantize
 
 from copy import deepcopy
@@ -18,6 +17,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+QUANTIZE = True
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -28,7 +29,12 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         # so we can use regular layer_norm
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        if QUANTIZE:
+          weight_dequant = dequantize(self.weight, self.weight.scale, self.weight.offset)
+          bias_dequant = dequantize(self.bias, self.bias.scale, self.bias.offset)
+          return F.layer_norm(input, self.weight.shape, weight_dequant, bias_dequant, 1e-5)
+        else:
+          return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
 
@@ -57,11 +63,16 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        if QUANTIZE:
+          self.c_attn.weight.data = dequantize(self.c_attn.weight, self.c_attn.weight.scale, self.c_attn.weight.offset)
+          self.c_attn.bias.data = dequantize(self.c_attn.bias, self.c_attn.bias.scale, self.c_attn.bias.offset)
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
+        if QUANTIZE:
+          self.c_attn.weight.data, _, _ = quantize(self.c_attn.weight.data)
+          self.c_attn.bias.data, _, _ = quantize(self.c_attn.bias.data)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -76,7 +87,13 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
+        if QUANTIZE:
+          self.c_proj.weight.data = dequantize(self.c_proj.weight, self.c_proj.weight.scale, self.c_proj.weight.offset)
+          self.c_proj.bias.data = dequantize(self.c_proj.bias, self.c_proj.bias.scale, self.c_proj.bias.offset)
         y = self.resid_dropout(self.c_proj(y))
+        if QUANTIZE:
+          self.c_proj.weight.data, _, _ = quantize(self.c_proj.weight.data)
+          self.c_proj.bias.data, _, _ = quantize(self.c_proj.bias.data)
         return y
 
 class MLP(nn.Module):
@@ -89,9 +106,21 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
+        if QUANTIZE:
+          self.c_fc.weight.data = dequantize(self.c_fc.weight, self.c_fc.weight.scale, self.c_fc.weight.offset)
+          self.c_fc.bias.data = dequantize(self.c_fc.bias, self.c_fc.bias.scale, self.c_fc.bias.offset)
         x = self.c_fc(x)
+        if QUANTIZE:
+          self.c_fc.weight.data, _, _ = quantize(self.c_fc.weight.data)
+          self.c_fc.bias.data, _, _ = quantize(self.c_fc.bias.data)
         x = self.gelu(x)
+        if QUANTIZE:
+          self.c_proj.weight.data = dequantize(self.c_proj.weight, self.c_proj.weight.scale, self.c_proj.weight.offset)
+          self.c_proj.bias.data = dequantize(self.c_proj.bias, self.c_proj.bias.scale, self.c_proj.bias.offset)
         x = self.c_proj(x)
+        if QUANTIZE:
+          self.c_proj.weight.data, _, _ = quantize(self.c_proj.weight.data)
+          self.c_proj.bias.data, _, _ = quantize(self.c_proj.bias.data)
         x = self.dropout(x)
         return x
 
@@ -180,8 +209,12 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        if QUANTIZE:
+          tok_emb = dequantize(tok_emb, self.transformer.wte.weight.scale, self.transformer.wte.weight.offset)
         # print("TOK_EMB DTYPE:", tok_emb.dtype)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        if QUANTIZE:
+          pos_emb = dequantize(pos_emb, self.transformer.wpe.weight.scale, self.transformer.wpe.weight.offset)
         # print("POS_EMB DTYPE:", pos_emb.dtype)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
@@ -194,7 +227,15 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
+            if QUANTIZE:
+              self.lm_head.weight.data = dequantize(self.lm_head.weight, self.lm_head.weight.scale, self.lm_head.weight.offset)
+              if self.lm_head.bias:
+                self.lm_head.bias.data = dequantize(self.lm_head.bias, self.lm_head.bias.scale, self.lm_head.bias.offset)
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            if QUANTIZE:
+              self.lm_head.weight.data, _, _ = quantize(self.lm_head.weight.data)
+              if self.lm_head.bias:
+                self.lm_head.bias.data, _, _ = quantize(self.lm_head.bias.data)
             loss = None
 
         return logits, loss
@@ -274,11 +315,12 @@ class GPT(nn.Module):
             param.requires_grad = False
             param_quantized, scale, offset = quantize(param.data)
             # just to test that quantization is working
-            param.data = dequantize(param_quantized, scale, offset)
-            # param.data = param_quantized
+            # param.data = dequantize(param_quantized, scale, offset)
+            param.data = param_quantized
             param.scale = scale
             param.offset = offset
-        # return model
+        if not QUANTIZE:
+          return model
         # for param in model_quantized.parameters():
         #   print(param.dtype)
         # raise("STOP")
@@ -350,5 +392,6 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+
 
         return idx
