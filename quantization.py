@@ -11,10 +11,11 @@ def quantize(X):
     scale = x_range / 255
     offset = (-torch.min(X) / scale - 128).round()
     X_quant = torch.clip((X / scale + offset).round(), -128, 127)
-    return X_quant, scale, offset
+    return X_quant.to(torch.int8), scale, offset
 
 def dequantize(X_quant, scale, offset):
     """
     Dequantize a given output vector X_quant given a scale and offset
     """
-    return (X_quant - offset) * scale 
+    dequant = (X_quant - offset) * scale 
+    return dequant.to(torch.float32)
