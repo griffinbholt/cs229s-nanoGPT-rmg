@@ -270,13 +270,18 @@ class GPT(nn.Module):
         quant_sd = model_quantized.state_dict()
         quant_sd_keys = quant_sd.keys()
         # print(sd_hf.keys())
-        for k in quant_sd_keys:
-            param = quant_sd[k]
+        for param in model_quantized.parameters():
             param.requires_grad = False
             param_quantized, scale, offset = quantize(param.data)
             # just to test that quantization is working
             param.data = dequantize(param_quantized, scale, offset)
+            # param.data = param_quantized
+            param.scale = scale
+            param.offset = offset
         # return model
+        # for param in model_quantized.parameters():
+        #   print(param.dtype)
+        # raise("STOP")
         return model_quantized
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
