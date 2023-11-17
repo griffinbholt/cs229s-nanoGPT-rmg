@@ -76,8 +76,8 @@ class CausalSelfAttention(nn.Module):
             self.seq_pos = T
 
             # update the kv cache
-            self.kv_cache[0, :, :, :T, :] = k
-            self.kv_cache[1, :, :, :T, :] = v
+            self.kv_cache[0, :B, :, :T, :] = k
+            self.kv_cache[1, :B, :, :T, :] = v
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
