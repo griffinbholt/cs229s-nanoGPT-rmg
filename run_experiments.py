@@ -36,31 +36,30 @@ import json
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
+eval_interval = 5
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*' TODO: check requirements
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'wikitext' ## TODO: may play w shakespeare first
+dataset = 'wikitext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 64 ## TODO: check requirements (decreased due to memory constraint)
+block_size = 1024
 # model
-n_layer = 4 ## TODO: check requirements (decreased due to memory constraint)
-n_head = 4 ## TODO: check requirements (decreased due to memory constraint)
-n_embd = 128 ## TODO: check requirements (decreased due to memory constraint)
+n_layer = 12
+n_head = 12
+n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
-stats_iters = 1 # number of training iterations to report stats TODO: increase to 500 for submission
+stats_iters = 500 # number of training iterations to report stats
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -147,46 +146,16 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+
+print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+# initialize from OpenAI GPT-2 weights
+override_args = dict(dropout=dropout)
+model = GPT.from_pretrained(init_from, override_args)
+# read off the created config params, so we can store them into checkpoint correctly
+for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    model_args[k] = getattr(model.config, k)
+
+
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -198,8 +167,6 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
 # compile the model
@@ -242,18 +209,11 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-# logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
-
 # report stats
 stats_to_report = {}
 v_loss = 0
 try_batch_sizes = [8,4,12]
 
-## TODO: might need to load a fresh model in each loop of batch sizes
 for bs in try_batch_sizes:
     batch_size = bs
     tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
@@ -273,31 +233,10 @@ for bs in try_batch_sizes:
             param_group['lr'] = lr
 
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and master_process:
+        if master_process and (batch_size == 8 or iter_num % eval_interval == 0):
             losses = estimate_loss()
             v_loss = losses['val'].item()
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'],
-                    "val/loss": losses['val'],
-                    "lr": lr,
-                    "mfu": running_mfu*100, # convert to percentage
-                })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
-                best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    print(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            print(f"step {iter_num}, batch size {batch_size}, block size {block_size}, local iter {local_iter_num} : train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if iter_num == 0 and eval_only:
             break
 
@@ -332,14 +271,6 @@ for bs in try_batch_sizes:
         dt = t1 - t0
         t0 = t1
         running_time += dt
-        if iter_num % log_interval == 0 and master_process:
-            # get loss as float. note: this is a CPU-GPU sync point
-            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-            lossf = loss.item() * gradient_accumulation_steps
-            if local_iter_num >= 5: # let the training loop settle a bit
-                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         iter_num += 1
         local_iter_num += 1
 
@@ -351,12 +282,16 @@ for bs in try_batch_sizes:
         if local_iter_num == stats_iters:
             if batch_size == 8:
                 stats_to_report["loss"] = v_loss
+                print("loss", v_loss)
+                stats_iters = 50
             elif batch_size == 4:
                 throughput = (tokens_per_iter * local_iter_num ) / running_time
                 stats_to_report["training_throughput_4"] = throughput
+                print("training_throughput_4", throughput)
             elif batch_size == 12:
                 throughput = (tokens_per_iter * local_iter_num ) / running_time
                 stats_to_report["training_throughput_12"] = throughput
+                print("training_throughput_12", throughput)
             break
 
     if ddp:
@@ -367,12 +302,12 @@ for bs in try_batch_sizes:
 ## inference ######################
 
 # -----------------------------------------------------------------------------
-init_from = 'gpt2' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl') TODO: check requirement
+init_from = 'gpt2' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-start = "humaneval.jsonl" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt" TODO: check requirement
+start = "humaneval.jsonl" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 3 # number of samples to draw
 num_warmup = 1 # how many warmups to do before benchmarking
-max_new_tokens = 128 # number of tokens generated in each sample
+max_new_tokens = 256 # number of tokens generated in each sample
 temperature = 0.4 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 speculative_tokens = 3 # how many tokens should the draft model decode?
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
@@ -395,21 +330,8 @@ print(f'Running on {device} in {ptdtype}')
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
-if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+# init from a given GPT-2 model
+model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
 model.eval()
 model.to(device)
@@ -418,23 +340,11 @@ if compile:
 
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"Loading meta from {meta_path}...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
+# ok let's assume gpt-2 encodings by default
+print("No meta.pkl found, assuming GPT-2 encodings...")
+enc = tiktoken.get_encoding("gpt2")
+encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+decode = lambda l: enc.decode(l)
 
 try_batch_size =[1,12]
 
@@ -477,8 +387,8 @@ for bs in try_batch_size:
               y = model.generate_kv(x, max_new_tokens, temperature=temperature, top_k=top_k)
               generations_kv.append(y[0].tolist())
               tmp = decode(generations_kv[-1])
-              print(tmp)
-              print('---------------')
+              #print(tmp)
+              #print('---------------')
   t1k  = time.time()
 
 
@@ -495,6 +405,5 @@ for bs in try_batch_size:
 
 with open("results.json", "w") as outfile:
     json.dump(stats_to_report, outfile)
-
 
 
