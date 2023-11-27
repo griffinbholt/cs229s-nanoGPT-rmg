@@ -44,9 +44,6 @@ if init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
-    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 elif init_from.startswith("gpt2-quantized"):
     # filename = init_from + ".pt"
     # weights_path = os.path.join(out_dir, filename)
@@ -54,6 +51,10 @@ elif init_from.startswith("gpt2-quantized"):
 
     model = GPT.from_quantized(init_from, dict(dropout=0.0))
     # model.load_state_dict(weights)
+elif init_from.startswith('gpt2'):
+    # init from a given GPT-2 model
+    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+
 
 model.eval()
 model.to(device)
