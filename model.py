@@ -293,6 +293,11 @@ class GPT(nn.Module):
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
+
+        filename = model_type + ".pt"
+        weights_path = os.path.join("out", filename)
+        weights = torch.load(weights_path, map_location='cuda')
+        model.load_state_dict(weights)
         return model
 
 

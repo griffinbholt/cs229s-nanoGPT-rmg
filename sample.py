@@ -48,12 +48,12 @@ elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 elif init_from.startswith("gpt2-quantized"):
-    filename = init_from + ".pt"
-    weights_path = os.path.join(out_dir, filename)
-    weights = torch.load(weights_path, map_location=device)
+    # filename = init_from + ".pt"
+    # weights_path = os.path.join(out_dir, filename)
+    # weights = torch.load(weights_path, map_location=device)
 
     model = GPT.from_quantized(init_from, dict(dropout=0.0))
-    model.load_state_dict(weights)
+    # model.load_state_dict(weights)
 
 model.eval()
 model.to(device)
