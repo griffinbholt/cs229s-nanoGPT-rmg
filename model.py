@@ -352,9 +352,10 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         if QUANTIZE:
-            model_quantized = deepcopy(model)
+            # model_quantized = deepcopy(model)
             # print(sd_hf.keys())
-            for param in model_quantized.parameters():
+            # for param in model_quantized.parameters():
+            for param in model.parameters():
                 param.requires_grad = False
                 param_quantized, scale, offset = quantize(param.data)
                 # just to test that quantization is working
@@ -365,11 +366,13 @@ class GPT(nn.Module):
 
             filename = "gpt2-quantized.pt" if model_type == "gpt2" else "gpt2-quantized" + model_type[4:] + ".pt"
             path = os.path.join('out', filename)
-            torch.save(model_quantized.state_dict(), path)
-            return model_quantized
+            # torch.save(model_quantized.state_dict(), path)
+            torch.save(model.state_dict(), path)
+            return model
+            # return model_quantized
 
         else:
-          return model
+            return model
         # for param in model_quantized.parameters():
         #   print(param.dtype)
         # raise("STOP")
