@@ -36,15 +36,15 @@ out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
+eval_only = True # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'wikitext'
+dataset = 'shakespeare'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -282,6 +282,7 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
+        print("MAX MEM: ", torch.cuda.max_memory_allocated())
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size

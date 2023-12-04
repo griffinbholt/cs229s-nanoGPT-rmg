@@ -20,8 +20,9 @@ from torch.nn import functional as F
 import numpy as np
 
 from memory_profiler import profile
+from transformers.models.oneformer.modeling_oneformer import OneFormerForUniversalSegmentationOutput
 
-QUANTIZE = True
+QUANTIZE = False
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -297,7 +298,26 @@ class GPT(nn.Module):
         filename = model_type + ".pt"
         weights_path = os.path.join("out", filename)
         weights = torch.load(weights_path, map_location='cuda')
-        model.load_state_dict(weights)
+        sd = model.state_dict()
+        for k in sd.keys():
+          with torch.no_grad():
+            sd[k].copy_(weights[k])
+        scales = weights['scales']
+        offsets = weights['offsets']
+
+        i = 0
+        for param in model.parameters():
+          param.requires_grad = False
+          scale, offset = scales[i], offsets[i]
+          param.data = param.data.type(torch.int8)
+          param.scale = scale
+          param.offset = offset
+          i += 1
+        # for param in model.parameters():
+        #   print(param)
+        #   print(param.scale)
+        #   print(param.offset)
+        #   raise("STOP")
         return model
 
 
@@ -360,6 +380,8 @@ class GPT(nn.Module):
             # model_quantized = deepcopy(model)
             # print(sd_hf.keys())
             # for param in model_quantized.parameters():
+            scales = []
+            offsets = []
             for param in model.parameters():
                 param.requires_grad = False
                 param_quantized, scale, offset = quantize(param.data)
@@ -369,10 +391,22 @@ class GPT(nn.Module):
                 param.scale = scale
                 param.offset = offset
 
+                # print(param)
+                # print(param.scale)
+                # print(param.offset)
+                # raise("STOP")
+
+                scales.append(param.scale)
+                offsets.append(param.offset)
+            model.register_buffer('scales', torch.tensor(scales, dtype=torch.float32))
+            model.register_buffer('offsets', torch.tensor(offsets, dtype=torch.float32))
             filename = "gpt2-quantized.pt" if model_type == "gpt2" else "gpt2-quantized" + model_type[4:] + ".pt"
             path = os.path.join('out', filename)
-            # torch.save(model_quantized.state_dict(), path)
             torch.save(model.state_dict(), path)
+            sd = model.state_dict()
+            # print(sd['scales'])
+            # print(sd['offsets'])
+            # raise("STOP HERE")
             return model
             # return model_quantized
 
@@ -425,7 +459,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    @profile
+    # @profile
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
@@ -453,6 +487,80 @@ class GPT(nn.Module):
         ppl = self.calculate_perplexity(idx)
         print("PERPLEXITY: ", ppl)
         return idx
+  
+    @torch.no_grad()
+    def generate_speculative(self, idx, max_new_tokens, draft_model, temperature=1.0, top_k=None, num_speculative=4):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        # note: making speculative decoding work with batch_size>1 is beyond this assignment's scope, because the
+        # tensors rapidly become ragged. So, you can assume that batch_size=1 for this part.
+        if idx.size(0) != 1:
+            raise ValueError("speculative decoding only works with batch size 1")
+        idx_length_original = idx.size(1)
+        
+        loop_counter = 0
+        while idx.size(1) < idx_length_original+max_new_tokens:
+            loop_counter += 1
+
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size-num_speculative else idx[:, -self.config.block_size-num_speculative:]
+
+            # Generate speculative tokens from the draft model. Then, run it through the main model.
+            # Be sure to set top_k=1, otherwise you'll pollute the RNG! (Which will make your code harder to debug.)
+
+            ### YOUR CODE HERE
+
+            # use the draft_model to generate speculative tokens
+            idx_speculative = draft_model.generate(idx_cond, num_speculative, temperature=temperature, top_k=1)
+            # print("IDX_SPECULATIVE SIZE:", idx_speculative.shape)
+            # obtain the logits from the main model by passing in the idx_speculative
+            all_logits, _ = self(idx_speculative)
+            
+            ### END YOUR CODE HERE
+
+            # Step through the predictions of the main model, sampling, and check whether they match the next token. Stop upon mismatch.
+            ### YOUR CODE HERE
+            all_accepted = True
+            # print("IDX_COND SIZE:", idx_cond.shape)
+            # iterate from the end position of idx_cond (prefix sequence) to the end position of idx_speculative (generated sequence)
+            for i in range(idx_cond.size(1) - 1, idx_speculative.size(1) - 1):
+                # pluck the logits at the current position and scale by desired temperature
+                logits = all_logits[:, i, :] / temperature
+                # optionally crop the logits to only the top k options
+                if top_k == 1:
+                    # TODO idx_next = ...
+                    idx_next = torch.argmax(logits, dim=-1).reshape((-1,1))
+                else:
+                    # TODO idx_next = ...
+                    probs = F.softmax(logits, dim=-1)
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                    idx_next = torch.multinomial(probs, num_samples = 1)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1).long()
+                # end the loop if the next token does not match the next token in idx_speculative
+                if idx_next != idx_speculative[:, i + 1]:
+                    all_accepted = False
+                    break
+            if all_accepted:
+                logits = all_logits[:, -1, :] / temperature
+                if top_k == 1:
+                    # TODO idx_next = ...
+                    idx_next = torch.argmax(logits, dim=-1).reshape((-1,1))
+                else:
+                    # TODO idx_next = ...
+                    probs = F.softmax(logits, dim=-1)
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                    idx_next = torch.multinomial(probs, num_samples = 1)
+                idx = torch.cat((idx, idx_next), dim=1).long()
+            ### END YOUR CODE HERE
+                
+        print(f"speculative decoding ran for {loop_counter} iterations")
+        return idx[:,:idx_length_original+max_new_tokens]
 
     def calculate_perplexity(self, idx):
       with torch.no_grad():

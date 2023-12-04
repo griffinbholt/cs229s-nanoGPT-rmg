@@ -93,11 +93,14 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 # 
 
+draft_model = GPT.from_quantized("gpt2-quantized", dict(dropout=0.0))
+draft_model.eval()
+draft_model.to(device)
 # run generation
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            y = model.generate_speculative(x, max_new_tokens, draft_model, temperature=temperature, top_k=top_k, num_speculative=4)
             print(decode(y[0].tolist()))
             print("MAX MEM: ", torch.cuda.max_memory_allocated())
             print('---------------')
