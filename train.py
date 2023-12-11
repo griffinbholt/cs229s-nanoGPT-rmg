@@ -28,7 +28,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
-
+from tqdm import tqdm
+import lora
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -38,13 +39,13 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'cs229s'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'wikitext'
+dataset = 'shakespeare'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -72,6 +73,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
+lora_layers = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -183,6 +185,16 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+    if lora_layers:
+        lora.add_lora_layers(model)
+        lora.freeze_model(model)
+        # for name, module in model.named_modules():
+        #   print(name)
+        #   print(module)
+        # for name, param in model.named_parameters():
+        #     print(name)
+        #     print(param.requires_grad)
+        # raise("STOP")
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -215,7 +227,7 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        for k in tqdm(range(eval_iters)):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
@@ -282,6 +294,7 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
+        print("MAX MEM: ", torch.cuda.max_memory_allocated())
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
@@ -328,6 +341,11 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+# tbh I'm not sure if this is the right place for this
+if lora_layers:
+    lora.merge_lora_layers(model)
+    lora.unfreeze_model(model)
 
 if ddp:
     destroy_process_group()
