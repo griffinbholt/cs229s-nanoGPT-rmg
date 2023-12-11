@@ -310,6 +310,11 @@ while True:
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
+    if iter_num % 100:
+        pass
+        # TODO - model.prune(p=TODO, m=TODO, rowwise=TODO) - break when reach 10% of the model size
+        # TODO - Checkpoint
+
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
