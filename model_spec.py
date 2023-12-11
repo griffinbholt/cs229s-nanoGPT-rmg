@@ -67,7 +67,7 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
             
         ### Initialize KV cache with up to a maximum sequence length. Also, keep track of how much of it is filled in self.seq_pos.
-        batch_dim = 2 # the maximum batch dimension we'll support. This is because T4 has smol mem.
+        batch_dim = 12 # the maximum batch dimension we'll support. This is because T4 has smol mem.
         seq_dim = 1500 # the maximum sequence length we'll support
         self.seq_pos = 0 # disabled by default
         self.kv_enabled = False # disabled by default
@@ -80,6 +80,8 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        attn_weight_copy = self.c_attn.weight.data
+        attn_bias_copy = self.c_attn.bias.data
         should_quantize = False
         if self.c_attn.weight.dtype == torch.int8:
           should_quantize = True
@@ -90,8 +92,8 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if should_quantize:
-          self.c_attn.weight.data, _, _ = quantize(self.c_attn.weight.data)
-          self.c_attn.bias.data, _, _ = quantize(self.c_attn.bias.data)
+          self.c_attn.weight.data = attn_weight_copy
+          self.c_attn.bias.data = attn_bias_copy
 
         ### Set KV cache if it exists:
         if self.kv_enabled:
@@ -118,13 +120,15 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
+        proj_weight_copy = self.c_proj.weight.data
+        proj_bias_copy = self.c_proj.bias.data
         if should_quantize:
           self.c_proj.weight.data = dequantize(self.c_proj.weight, self.c_proj.weight.scale, self.c_proj.weight.offset)
           self.c_proj.bias.data = dequantize(self.c_proj.bias, self.c_proj.bias.scale, self.c_proj.bias.offset)
         y = self.resid_dropout(self.c_proj(y))
         if should_quantize:
-          self.c_proj.weight.data, _, _ = quantize(self.c_proj.weight.data)
-          self.c_proj.bias.data, _, _ = quantize(self.c_proj.bias.data)
+          self.c_proj.weight.data = proj_weight_copy
+          self.c_proj.bias.data = proj_bias_copy
         return y
 
 
@@ -134,6 +138,8 @@ class CausalSelfAttention(nn.Module):
         
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        attn_weight_copy = self.c_attn.weight.data
+        attn_bias_copy = self.c_attn.bias.data
         should_quantize = False
         if self.c_attn.weight.dtype == torch.int8:
           should_quantize = True
@@ -147,8 +153,8 @@ class CausalSelfAttention(nn.Module):
         newSeqPos = self.seq_pos+T
 
         if should_quantize:
-          self.c_attn.weight.data, _, _ = quantize(self.c_attn.weight.data)
-          self.c_attn.bias.data, _, _ = quantize(self.c_attn.bias.data)
+          self.c_attn.weight.data = attn_weight_copy
+          self.c_attn.bias.data = attn_bias_copy
 
         # update the kv cache with the additional input
         self.kv_cache[0, :B, :, self.seq_pos:newSeqPos, :] = kNew
@@ -167,13 +173,15 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
+        proj_weight_copy = self.c_proj.weight.data
+        proj_bias_copy = self.c_proj.bias.data
         if should_quantize:
           self.c_proj.weight.data = dequantize(self.c_proj.weight, self.c_proj.weight.scale, self.c_proj.weight.offset)
           self.c_proj.bias.data = dequantize(self.c_proj.bias, self.c_proj.bias.scale, self.c_proj.bias.offset)
         y = self.resid_dropout(self.c_proj(y))
         if should_quantize:
-          self.c_proj.weight.data, _, _ = quantize(self.c_proj.weight.data)
-          self.c_proj.bias.data, _, _ = quantize(self.c_proj.bias.data)
+          self.c_proj.weight.data = proj_weight_copy
+          self.c_proj.bias.data = proj_bias_copy
 
         # update the position
         self.seq_pos = newSeqPos
@@ -193,22 +201,26 @@ class MLP(nn.Module):
 
     def forward(self, x):
         should_quantize = False
+        fc_weight_copy = self.c_fc.weight.data
+        fc_bias_copy = self.c_fc.bias.data
         if self.c_fc.weight.dtype == torch.int8:
           should_quantize = True
           self.c_fc.weight.data = dequantize(self.c_fc.weight, self.c_fc.weight.scale, self.c_fc.weight.offset)
           self.c_fc.bias.data = dequantize(self.c_fc.bias, self.c_fc.bias.scale, self.c_fc.bias.offset)
         x = self.c_fc(x)
         if should_quantize:
-          self.c_fc.weight.data, _, _ = quantize(self.c_fc.weight.data)
-          self.c_fc.bias.data, _, _ = quantize(self.c_fc.bias.data)
+          self.c_fc.weight.data = fc_weight_copy
+          self.c_fc.bias.data = fc_bias_copy
         x = self.gelu(x)
+        proj_weight_copy = self.c_proj.weight.data
+        proj_bias_copy = self.c_proj.bias.data
         if should_quantize:
           self.c_proj.weight.data = dequantize(self.c_proj.weight, self.c_proj.weight.scale, self.c_proj.weight.offset)
           self.c_proj.bias.data = dequantize(self.c_proj.bias, self.c_proj.bias.scale, self.c_proj.bias.offset)
         x = self.c_proj(x)
         if should_quantize:
-          self.c_proj.weight.data, _, _ = quantize(self.c_proj.weight.data)
-          self.c_proj.bias.data, _, _ = quantize(self.c_proj.bias.data)
+          self.c_proj.weight.data = proj_weight_copy
+          self.c_proj.bias.data = proj_bias_copy
         x = self.dropout(x)
         return x
 
@@ -309,7 +321,6 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        # print("IDX DTYPE: ", idx.dtype)
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
@@ -331,18 +342,24 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            lm_head_weight_copy = self.lm_head.weight.data
+            if self.lm_head.bias:
+              lm_head_bias_copy = self.lm_head.bias.data
             if should_quantize:
                 self.lm_head.weight.data = dequantize(self.lm_head.weight, self.lm_head.weight.scale, self.lm_head.weight.offset)
                 if self.lm_head.bias:
                   self.lm_head.bias.data = dequantize(self.lm_head.bias, self.lm_head.bias.scale, self.lm_head.bias.offset)
             logits = self.lm_head(x)
             if should_quantize:
-              self.lm_head.weight.data, _, _ = quantize(self.lm_head.weight.data)
+              self.lm_head.weight.data = lm_head_weight_copy
               if self.lm_head.bias:
-                self.lm_head.bias.data, _, _ = quantize(self.lm_head.bias.data)
+                self.lm_head.bias.data = lm_head_bias_copy
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
+            lm_head_weight_copy = self.lm_head.weight.data
+            if self.lm_head.bias:
+              lm_head_bias_copy = self.lm_head.bias.data
             if should_quantize:
               self.lm_head.weight.data = dequantize(self.lm_head.weight, self.lm_head.weight.scale, self.lm_head.weight.offset)
               if self.lm_head.bias:
@@ -350,9 +367,9 @@ class GPT(nn.Module):
             #logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             logits = self.lm_head(x)
             if should_quantize:
-              self.lm_head.weight.data, _, _ = quantize(self.lm_head.weight.data)
+              self.lm_head.weight.data = lm_head_weight_copy
               if self.lm_head.bias:
-                self.lm_head.bias.data, _, _ = quantize(self.lm_head.bias.data)
+                self.lm_head.bias.data = lm_head_bias_copy
             loss = None
 
         return logits, loss
@@ -381,15 +398,18 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         # inference-time mini-optimization: only forward the lm_head on the very last position
+        lm_head_weight_copy = self.lm_head.weight.data
+        if self.lm_head.bias:
+          lm_head_bias_copy = self.lm_head.bias.data
         if should_quantize:
             self.lm_head.weight.data = dequantize(self.lm_head.weight, self.lm_head.weight.scale, self.lm_head.weight.offset)
             if self.lm_head.bias:
                 self.lm_head.bias.data = dequantize(self.lm_head.bias, self.lm_head.bias.scale, self.lm_head.bias.offset)
         logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
         if should_quantize:
-            self.lm_head.weight.data, _, _ = quantize(self.lm_head.weight.data)
+            self.lm_head.weight.data = lm_head_weight_copy
             if self.lm_head.bias:
-                self.lm_head.bias.data, _, _ = quantize(self.lm_head.bias.data)
+                self.lm_head.bias.data = lm_head_bias_copy
 
         return logits
 
