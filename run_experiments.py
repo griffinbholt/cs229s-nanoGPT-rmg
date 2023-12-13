@@ -36,7 +36,7 @@ import json
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 5
+eval_interval = 100
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = False # if True, always save a checkpoint after each eval
@@ -233,7 +233,7 @@ for bs in try_batch_sizes:
             param_group['lr'] = lr
 
         # evaluate the loss on train/val sets and write checkpoints
-        if master_process and (batch_size == 8 or iter_num % eval_interval == 0):
+        if master_process and (iter_num % eval_interval == 0):
             losses = estimate_loss()
             v_loss = losses['val'].item()
             print(f"step {iter_num}, batch size {batch_size}, block size {block_size}, local iter {local_iter_num} : train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
