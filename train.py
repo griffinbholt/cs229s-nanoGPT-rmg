@@ -27,8 +27,12 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
-
+# uncomment the import below if you're running the quantized model
+from model_quant import GPTConfig, GPT
+# uncomment the import below if you're not running the quantized model
+# from model import GPTConfig, GPT
+from tqdm import tqdm
+import lora
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -38,7 +42,7 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'gpt2-medium' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'gpt2' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'cs229s'
@@ -72,6 +76,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
+lora_layers = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -175,6 +180,10 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+elif init_from.startswith('gpt2-quantized'):
+    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+    override_args = dict(dropout=dropout)
+    model = GPT.from_quantized(init_from, override_args)
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -183,11 +192,19 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+    if lora_layers:
+        lora.add_lora_layers(model)
+        lora.freeze_model(model)
+        print("PRINTING MODULES + REQUIRES_GRAD():")
+        for name, param in model.named_parameters():
+            print(name)
+            print(param.requires_grad)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+print("MAX MEM:", torch.cuda.max_memory_allocated())
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -215,7 +232,7 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        for k in tqdm(range(eval_iters)):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
@@ -250,7 +267,9 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
-
+    # for name, param in model.named_parameters():
+    #     print(name)
+    #     print(param.requires_grad)
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -282,6 +301,7 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
+        print("MAX MEM: ", torch.cuda.max_memory_allocated())
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
@@ -328,6 +348,13 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+# tbh I'm not sure if this is the right place for this
+if lora_layers:
+    lora.merge_lora_layers(model)
+    lora.unfreeze_model(model)
+    path = os.path.join('out', 'lora.pt')
+    torch.save(model.state_dict(), path)
 
 if ddp:
     destroy_process_group()
